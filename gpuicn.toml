@@ -1,0 +1,7 @@
+version = 2
+registry = "https://raw.githubusercontent.com/karyalabs/gpuicn/v0.13.4/site/pages/r"
+output = "src/ui"
+
+[theme]
+base_color = "zinc"
+appearance = "system"

@@ -1,0 +1,639 @@
+//! Nova modal surfaces using Kit's dialog host and caller-owned handles.
+#[path = "modal_focus.rs"]
+#[doc(hidden)]
+pub mod modal_focus;
+use super::{
+    button::{Button, ButtonSize, ButtonVariant},
+    theme::{
+        UiText, UiTheme,
+        locale::{self, DirectionalStyled as _},
+        presence,
+        primitives::{dismiss, surface, text},
+    },
+};
+use gpui_icons::{LucideIcon, lucide};
+pub use gpui_kit::base::{Dialog, DialogChangeReason, DialogHandle};
+use gpui_kit::{
+    AnyElement, App, Div, ElementId, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
+    ParentElement, SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window, div,
+    px,
+};
+
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub enum DialogControlAction {
+    Cancel,
+    Confirm,
+}
+
+/// A styled dialog button that routes its action through its own dialog tree.
+#[derive(IntoElement)]
+pub struct DialogControl {
+    button: Button,
+    action: DialogControlAction,
+    anchor_key: &'static str,
+    anchor_id: ElementId,
+}
+
+impl DialogControl {
+    #[doc(hidden)]
+    pub fn new(
+        id: impl Into<ElementId>,
+        action: DialogControlAction,
+        anchor_key: &'static str,
+    ) -> Self {
+        let id = id.into();
+        Self {
+            button: Button::new(id.clone()),
+            action,
+            anchor_key,
+            anchor_id: id,
+        }
+    }
+
+    /// Sets the visual variant.
+    pub fn variant(mut self, variant: ButtonVariant) -> Self {
+        self.button = self.button.variant(variant);
+        self
+    }
+
+    /// Sets the visual size.
+    pub fn size(mut self, size: ButtonSize) -> Self {
+        self.button = self.button.size(size);
+        self
+    }
+
+    /// Prevents activation and removes the button from tab order.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.button = self.button.disabled(disabled);
+        self
+    }
+
+    /// Sets the accessible name for icon or custom content.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.button = self.button.aria_label(label);
+        self
+    }
+
+    /// Adds visible text and uses it as the accessible name.
+    pub fn label(mut self, label: impl Into<SharedString>) -> Self {
+        self.button = self.button.label(label);
+        self
+    }
+}
+
+impl ParentElement for DialogControl {
+    fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
+        self.button.extend(elements);
+    }
+}
+
+impl Styled for DialogControl {
+    fn style(&mut self) -> &mut gpui_kit::StyleRefinement {
+        self.button.style()
+    }
+}
+
+impl gpui_kit::RenderOnce for DialogControl {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let anchor = window
+            .use_keyed_state((self.anchor_id, self.anchor_key), cx, |_, cx| {
+                cx.focus_handle()
+            })
+            .read(cx)
+            .clone();
+        let dispatch_from = anchor.clone();
+        let action = self.action;
+
+        self.button
+            .child(div().absolute().size_0().track_focus(&anchor))
+            .on_click(move |_, window, cx| match action {
+                DialogControlAction::Cancel => {
+                    dispatch_from.dispatch_action(&gpui_kit::base::actions::Cancel, window, cx)
+                }
+                DialogControlAction::Confirm => dispatch_from.dispatch_action(
+                    &gpui_kit::base::actions::Confirm { secondary: false },
+                    window,
+                    cx,
+                ),
+            })
+    }
+}
+
+/// Like [`dialog`], but builds the popup only while the dialog is open.
+///
+/// Keep the host mounted while closed so it can return focus; `build` runs
+/// only on frames where `handle` is open, so a closed dialog costs no more
+/// than its focus bookkeeping. Prefer this over [`dialog`] whenever the
+/// content takes work to build.
+pub fn dialog_with<E: IntoElement>(
+    id: impl Into<ElementId>,
+    handle: &DialogHandle,
+    build: impl FnOnce(&mut Window, &mut App) -> E,
+    window: &mut Window,
+    cx: &mut App,
+) -> Dialog {
+    let popup = lazy_popup(handle, build, window, cx);
+    dialog(id, handle, popup, window, cx)
+}
+
+/// The popup `build` returns while `handle` is open, and an empty element
+/// while it is closed.
+#[doc(hidden)]
+pub fn lazy_popup<E: IntoElement>(
+    handle: &DialogHandle,
+    build: impl FnOnce(&mut Window, &mut App) -> E,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui_kit::AnyElement {
+    if handle.is_open() {
+        build(window, cx).into_any_element()
+    } else {
+        div().into_any_element()
+    }
+}
+
+/// Keep the host mounted while closed so it can restore focus after dismissal.
+///
+/// The caller builds `popup` on every frame, open or closed; use
+/// [`dialog_with`] to build it only while the dialog is open.
+pub fn dialog(
+    id: impl Into<ElementId>,
+    handle: &DialogHandle,
+    popup: impl IntoElement,
+    window: &mut Window,
+    cx: &mut App,
+) -> Dialog {
+    let id = id.into();
+    let open = handle.is_open();
+    let focus = modal_focus::prepare(id.clone(), open, window, cx);
+    let scope = modal_focus::ModalFocus::new(id.clone());
+    // Kit removes the popup when the handle closes, so only the entrance is
+    // animated: a fade with a short rise, as in shadcn's `zoom-in-95`.
+    let entrance = presence((id.clone(), "presence"), open, window, cx).progress;
+    let t = UiTheme::read(cx).clone();
+    let popup = dismiss::on_escape(scope.trap(div(), true), |window, cx| {
+        window.dispatch_action(Box::new(gpui_kit::base::actions::Cancel), cx);
+        true
+    })
+    .id(id.clone())
+    .track_focus(&focus)
+    // The popup sets its own width: `dialog_popup` caps it at 384 px, and a
+    // wider sheet overrides that with its own `max_w`.
+    .w_full()
+    .relative()
+    .top(t.space(2.) * (1. - entrance))
+    .opacity(entrance)
+    .child(scope.boundary(false))
+    .child(scope.boundary(true))
+    .child(modal_viewport((id.clone(), "viewport"), popup, window, cx));
+    Dialog::new(cx)
+        .handle(handle.clone())
+        .close_on_escape(false)
+        .flex()
+        .items_center()
+        .justify_center()
+        .p(t.space(4.))
+        .backdrop(dismiss_backdrop(cx).opacity(entrance))
+        .popup(popup)
+        // Enter in an arbitrary child must not dismiss an unfinished form.
+        .on_ok(|_, _, _| false)
+}
+/// Keeps a modal's full content reachable even in a short window.
+///
+/// The wheel reaches this viewport only through surfaces that use
+/// `block_mouse_except_scroll()`, as `dialog_popup` does; a custom surface
+/// that calls `occlude()` hides the wheel from it and stays clipped.
+#[doc(hidden)]
+pub fn modal_viewport(
+    id: impl Into<ElementId>,
+    popup: impl IntoElement,
+    window: &Window,
+    cx: &App,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .max_h((window.viewport_size().height - UiTheme::read(cx).space(8.)).max(px(0.)))
+        .overflow_y_scroll()
+        .w_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .child(popup)
+}
+
+/// A keyboard-accessible button opening the caller's handle.
+pub fn dialog_trigger(id: impl Into<ElementId>, handle: &DialogHandle) -> Button {
+    let handle = handle.clone();
+    Button::new(id)
+        .variant(ButtonVariant::Outline)
+        .on_click(move |_, window, cx| handle.open(window, cx))
+}
+/// Full-window modal backdrop.
+pub fn dialog_backdrop(cx: &App) -> Div {
+    div()
+        .absolute()
+        .inset_0()
+        .bg(UiTheme::read(cx).colors.overlay)
+        .occlude()
+}
+/// A backdrop that dismisses its dialog when pressed. The occluding backdrop
+/// hides the press from Kit's host, so it routes Cancel through the dialog's
+/// veto callback itself.
+#[doc(hidden)]
+pub fn dismiss_backdrop(cx: &App) -> Div {
+    dialog_backdrop(cx).on_mouse_down(MouseButton::Left, |_, window, cx| {
+        window.dispatch_action(Box::new(gpui_kit::base::actions::Cancel), cx);
+        cx.stop_propagation();
+    })
+}
+/// Stacked dialog heading content.
+pub fn dialog_header(cx: &App) -> Div {
+    div().flex().flex_col().gap(UiTheme::read(cx).space(2.))
+}
+/// Inset action footer.
+pub fn dialog_footer(cx: &App) -> Div {
+    let t = UiTheme::read(cx);
+    div()
+        .mx(-t.space(4.))
+        .mb(-t.space(4.))
+        .flex_row_in(t.direction)
+        .justify_end()
+        .gap(t.space(2.))
+        .rounded_b(t.radius.xl)
+        .border_t_1()
+        .border_color(t.colors.border)
+        .bg(t.colors.muted.opacity(0.5))
+        .p(t.space(4.))
+}
+/// Named popup surface with modal Tab traversal, including caller-owned inputs.
+///
+/// It is at most 384 px wide; call `.max_w(..)` on it for a wider sheet.
+pub fn dialog_popup(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    cx: &App,
+) -> Stateful<Div> {
+    let t = UiTheme::read(cx);
+    let id = id.into();
+    let popup = div()
+        .id(id)
+        .aria_label(label)
+        // Blocks clicks and hover behind the surface but lets the wheel reach
+        // the host's `modal_viewport`, which `occlude` would hide it from.
+        .block_mouse_except_scroll()
+        .w_full()
+        .min_w(px(0.))
+        .max_w(t.space(96.))
+        .flex()
+        .flex_col()
+        .gap(t.space(4.))
+        .p(t.space(4.));
+    // The host's viewport scrolls a tall dialog; the surface itself never does,
+    // so there is one scroll container and the footer stays with the content.
+    surface::modal(popup, t)
+}
+/// Medium-weight dialog title.
+pub fn dialog_title(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
+    let t = UiTheme::read(cx);
+    div()
+        .id(id)
+        .role(gpui_kit::Role::Heading)
+        .aria_level(2)
+        .font_family(t.fonts.heading.clone())
+        .font_weight(FontWeight::MEDIUM)
+        .text_size(t.text(16.))
+        .line_height(text::line_height(t, t.text(16.)))
+        .text_color(t.colors.popover_foreground)
+}
+/// Muted dialog description.
+pub fn dialog_description(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
+    let t = UiTheme::read(cx);
+    text::muted(div().id(id), t)
+}
+/// Icon-only close control; Kit routes Cancel through the owning dialog's veto callback.
+pub fn dialog_close(id: impl Into<ElementId>, cx: &App) -> DialogControl {
+    let t = UiTheme::read(cx);
+    DialogControl::new(
+        id,
+        DialogControlAction::Cancel,
+        "gpuicn-dialog-close-anchor",
+    )
+    .aria_label(locale::text(cx, UiText::Close))
+    .variant(ButtonVariant::Ghost)
+    .size(ButtonSize::IconSm)
+    .absolute()
+    .top(t.space(2.))
+    .inset_end(t.direction, t.space(2.))
+    .child(
+        lucide(LucideIcon::X)
+            .size(t.space(4.))
+            .text_color(t.colors.popover_foreground),
+    )
+}
+/// Create form actions with `Button`; close the handle after successful validation.
+pub fn dialog_action(id: impl Into<ElementId>, handle: &DialogHandle) -> Button {
+    let handle = handle.clone();
+    Button::new(id).on_click(move |_, window, cx| handle.close(window, cx))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use gpui_kit::{
+        Context, FocusHandle, Render, TestAppContext, point, prelude::FluentBuilder as _,
+    };
+
+    use super::*;
+
+    struct DialogControlHarness {
+        dialog_focus: FocusHandle,
+        retained_focus: FocusHandle,
+        handle: DialogHandle,
+        cancel_count: Rc<Cell<usize>>,
+    }
+
+    impl Render for DialogControlHarness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let cancel_count = self.cancel_count.clone();
+            div()
+                .child(div().absolute().size_0().track_focus(&self.retained_focus))
+                .child(
+                    Dialog::new(cx)
+                        .handle(self.handle.clone())
+                        .focus_handle(self.dialog_focus.clone())
+                        .on_cancel(move |_, _, _| {
+                            cancel_count.set(cancel_count.get() + 1);
+                            true
+                        })
+                        .popup(
+                            DialogControl::new(
+                                "cancel",
+                                DialogControlAction::Cancel,
+                                "dialog-control-test-anchor",
+                            )
+                            .size_full()
+                            .label("Cancel"),
+                        ),
+                )
+        }
+    }
+
+    #[gpui_kit::test]
+    fn dialog_control_routes_from_its_own_anchor(cx: &mut TestAppContext) {
+        cx.update(super::super::theme::init);
+        let handle = DialogHandle::new(true);
+        let cancel_count = Rc::new(Cell::new(0));
+        let (view, cx) = cx.add_window_view({
+            let handle = handle.clone();
+            let cancel_count = cancel_count.clone();
+            move |_, cx| DialogControlHarness {
+                dialog_focus: cx.focus_handle(),
+                retained_focus: cx.focus_handle(),
+                handle,
+                cancel_count,
+            }
+        });
+        cx.update(|window, cx| {
+            let retained_focus = view.read(cx).retained_focus.clone();
+            retained_focus.focus(window, cx);
+            window.draw(cx).clear(cx);
+        });
+
+        cx.simulate_click(point(px(20.), px(20.)), Default::default());
+        cx.run_until_parked();
+
+        assert_eq!(cancel_count.get(), 1);
+        assert!(!handle.is_open());
+    }
+
+    struct TwoDialogControlHarness {
+        first_focus: FocusHandle,
+        second_focus: FocusHandle,
+        first_handle: DialogHandle,
+        second_handle: DialogHandle,
+        first_count: Rc<Cell<usize>>,
+        second_count: Rc<Cell<usize>>,
+    }
+
+    impl Render for TwoDialogControlHarness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let first_count = self.first_count.clone();
+            let second_count = self.second_count.clone();
+            div()
+                .child(
+                    Dialog::new(cx)
+                        .handle(self.first_handle.clone())
+                        .focus_handle(self.first_focus.clone())
+                        .on_cancel(move |_, _, _| {
+                            first_count.set(first_count.get() + 1);
+                            true
+                        })
+                        .popup(
+                            DialogControl::new(
+                                "first-cancel",
+                                DialogControlAction::Cancel,
+                                "shared-dialog-control-anchor",
+                            )
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .w(px(40.))
+                            .h(px(40.))
+                            .label("First"),
+                        ),
+                )
+                .child(
+                    Dialog::new(cx)
+                        .handle(self.second_handle.clone())
+                        .focus_handle(self.second_focus.clone())
+                        .on_cancel(move |_, _, _| {
+                            second_count.set(second_count.get() + 1);
+                            true
+                        })
+                        .popup(
+                            DialogControl::new(
+                                "second-cancel",
+                                DialogControlAction::Cancel,
+                                "shared-dialog-control-anchor",
+                            )
+                            .absolute()
+                            .left(px(60.))
+                            .top_0()
+                            .w(px(40.))
+                            .h(px(40.))
+                            .label("Second"),
+                        ),
+                )
+        }
+    }
+
+    #[gpui_kit::test]
+    fn dialog_controls_keep_distinct_anchors_in_one_window(cx: &mut TestAppContext) {
+        cx.update(super::super::theme::init);
+        let first_handle = DialogHandle::new(true);
+        let second_handle = DialogHandle::new(true);
+        let first_count = Rc::new(Cell::new(0));
+        let second_count = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let first_handle = first_handle.clone();
+            let second_handle = second_handle.clone();
+            let first_count = first_count.clone();
+            let second_count = second_count.clone();
+            move |_, cx| TwoDialogControlHarness {
+                first_focus: cx.focus_handle(),
+                second_focus: cx.focus_handle(),
+                first_handle,
+                second_handle,
+                first_count,
+                second_count,
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        cx.simulate_click(point(px(80.), px(20.)), Default::default());
+        cx.run_until_parked();
+
+        assert_eq!(first_count.get(), 0);
+        assert_eq!(second_count.get(), 1);
+        assert!(first_handle.is_open());
+        assert!(!second_handle.is_open());
+    }
+
+    struct TallDialog {
+        handle: DialogHandle,
+    }
+
+    impl Render for TallDialog {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let popup = dialog_popup("tall-popup", "Preferences", cx)
+                .child(div().h(px(1200.)).flex_shrink_0().child("Settings"))
+                .child(
+                    div()
+                        .h(px(32.))
+                        .flex_shrink_0()
+                        .debug_selector(|| "tall-footer".into())
+                        .child("Save"),
+                );
+            div()
+                .size_full()
+                .child(
+                    div().id("page").size_full().overflow_y_scroll().child(
+                        div()
+                            .h(px(4000.))
+                            .debug_selector(|| "page-content".into())
+                            .child("Page"),
+                    ),
+                )
+                .child(dialog("tall", &self.handle, popup, window, cx))
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_tall_dialog_scrolls_under_the_pointer(cx: &mut TestAppContext) {
+        use gpui_kit::{ScrollDelta, ScrollEvent};
+        cx.update(super::super::theme::init);
+        let handle = DialogHandle::new(true);
+        let (_, cx) = cx.add_window_view({
+            let handle = handle.clone();
+            move |_, _| TallDialog { handle }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let footer = cx.debug_bounds("tall-footer").unwrap();
+        assert!(
+            footer.bottom() > viewport.height,
+            "the footer starts below the fold"
+        );
+
+        let page = cx.debug_bounds("page-content").unwrap();
+        let center = point(viewport.width / 2., viewport.height / 2.);
+        cx.simulate_mouse_move(center, None, Default::default());
+        cx.simulate_event(ScrollEvent {
+            position: center,
+            delta: ScrollDelta::Pixels(point(px(0.), px(-1400.))),
+            ..Default::default()
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let footer = cx.debug_bounds("tall-footer").unwrap();
+        assert!(
+            footer.bottom() <= viewport.height,
+            "the wheel over the surface scrolls the dialog: footer at {footer:?}"
+        );
+        assert_eq!(
+            cx.debug_bounds("page-content").unwrap(),
+            page,
+            "the backdrop keeps the wheel from the page behind the dialog"
+        );
+    }
+
+    struct SizedDialog {
+        handle: DialogHandle,
+        width: Option<f32>,
+    }
+
+    impl Render for SizedDialog {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let popup = dialog_popup("sized-popup", "Accounts", cx)
+                .debug_selector(|| "sized-popup".into())
+                .when_some(self.width, |popup, width| popup.max_w(px(width)));
+            div()
+                .size_full()
+                .child(dialog("sized", &self.handle, popup, window, cx))
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_popup_sets_its_own_width_and_stays_centered(cx: &mut TestAppContext) {
+        cx.update(super::super::theme::init);
+        for (width, expected) in [(None, 384.), (Some(560.), 560.)] {
+            let handle = DialogHandle::new(true);
+            let (_, cx) = cx.add_window_view(move |_, _| SizedDialog { handle, width });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let viewport = cx.update(|window, _| window.viewport_size());
+            let popup = cx.debug_bounds("sized-popup").unwrap();
+            assert_eq!(popup.size.width, px(expected));
+            assert_eq!(popup.center().x, viewport.width / 2.);
+        }
+    }
+
+    struct LazyDialog {
+        handle: DialogHandle,
+        builds: Rc<Cell<usize>>,
+    }
+
+    impl Render for LazyDialog {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let builds = self.builds.clone();
+            div().size_full().child(dialog_with(
+                "lazy",
+                &self.handle,
+                move |_, cx| {
+                    builds.set(builds.get() + 1);
+                    dialog_popup("lazy-popup", "Settings", cx)
+                },
+                window,
+                cx,
+            ))
+        }
+    }
+
+    #[gpui_kit::test]
+    fn dialog_with_builds_only_while_open(cx: &mut TestAppContext) {
+        cx.update(super::super::theme::init);
+        let handle = DialogHandle::new(false);
+        let builds = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let handle = handle.clone();
+            let builds = builds.clone();
+            move |_, _| LazyDialog { handle, builds }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(builds.get(), 0, "a closed dialog builds nothing");
+        cx.update(|window, cx| handle.open(window, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(builds.get() > 0, "an open dialog builds its popup");
+    }
+}

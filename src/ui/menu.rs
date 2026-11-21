@@ -1,0 +1,1058 @@
+//! Nova menus composed from Kit buttons and popup positioning.
+use super::{
+    button::{ButtonSize, ButtonVariant, style_button},
+    kbd::{format_shortcut, key_label},
+    theme::{
+        UiTheme, apply_style,
+        locale::DirectionalStyled as _,
+        primitives::{disabled, dismiss, surface, text},
+    },
+};
+use gpui_icons::{LucideIcon, lucide};
+use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::base::{Align, Button, ElementExt as _, Placement, Positioner};
+use gpui_kit::{
+    AnyElement, App, Bounds, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable,
+    FontWeight, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels,
+    Point, Render, RenderOnce, Role, SharedString, StatefulInteractiveElement as _,
+    StyleRefinement, Styled, Window, div, prelude::FluentBuilder as _,
+};
+use std::{rc::Rc, time::Duration};
+
+type Handler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+type Slot = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
+#[derive(Clone)]
+/// An action, check item, radio item, separator or submenu entry.
+pub struct MenuItem {
+    id: ElementId,
+    label: SharedString,
+    disabled: bool,
+    checked: Option<bool>,
+    radio: bool,
+    link: bool,
+    handler: Option<Handler>,
+    children: Vec<MenuItem>,
+    separator: bool,
+    icon: Option<LucideIcon>,
+    leading: Option<Slot>,
+    description: Option<SharedString>,
+    trailing: Option<Slot>,
+    shortcut: Option<SharedString>,
+}
+impl MenuItem {
+    /// Creates an action with a caller-owned ID, unique within this menu tree.
+    pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            disabled: false,
+            checked: None,
+            radio: false,
+            link: false,
+            handler: None,
+            children: Vec::new(),
+            separator: false,
+            icon: None,
+            leading: None,
+            description: None,
+            trailing: None,
+            shortcut: None,
+        }
+    }
+    /// Shows a 16px Lucide icon in muted color at the row's leading edge.
+    pub fn icon(mut self, icon: LucideIcon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+    /// Renders a caller-built element at the row's leading edge, such as an
+    /// avatar or a team tile. It replaces [`MenuItem::icon`]. The closure runs
+    /// on every render of the open menu, so items stay cheap to clone.
+    pub fn leading(mut self, slot: impl Fn(&mut Window, &mut App) -> AnyElement + 'static) -> Self {
+        self.leading = Some(Rc::new(slot));
+        self
+    }
+    /// Shows a muted secondary line under the label.
+    pub fn description(mut self, text: impl Into<SharedString>) -> Self {
+        self.description = Some(text.into());
+        self
+    }
+    /// Renders a caller-built element right-aligned before the shortcut, such
+    /// as an unread count or a status dot.
+    pub fn trailing(
+        mut self,
+        slot: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) -> Self {
+        self.trailing = Some(Rc::new(slot));
+        self
+    }
+    /// Shows a keyboard shortcut at the far right, written like a key binding
+    /// (`"secondary-alt-1"`) and drawn for the running platform (`⌘⌥1` on
+    /// macOS, `Ctrl+Alt+1` elsewhere). Text that does not parse is shown as
+    /// written, so a plain hint such as `"Settings"` works too.
+    pub fn shortcut(mut self, shortcut: impl Into<SharedString>) -> Self {
+        self.shortcut = Some(shortcut.into());
+        self
+    }
+    fn rich(&self) -> bool {
+        self.icon.is_some() || self.leading.is_some() || self.description.is_some()
+    }
+    /// Disables interaction and applies the disabled appearance.
+    pub fn disabled(mut self, value: bool) -> Self {
+        self.disabled = value;
+        self
+    }
+    /// Makes this a checkbox item with the supplied initial state.
+    pub fn checked(mut self, value: bool) -> Self {
+        self.checked = Some(value);
+        self
+    }
+    /// Makes this a radio item; activating it clears radio siblings at this menu level.
+    pub fn radio(mut self, value: bool) -> Self {
+        self.checked = Some(value);
+        self.radio = true;
+        self
+    }
+    /// Handles activation by pointer, keyboard or an accessibility action.
+    /// It runs after the menu closes and its state update returns, so it may
+    /// call [`MenuState::set_items`].
+    pub fn on_click(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.handler = Some(Rc::new(handler));
+        self
+    }
+    /// Marks a link; the caller handles navigation through `on_click`.
+    pub fn link(mut self) -> Self {
+        self.link = true;
+        self
+    }
+    /// Creates an item containing another level of menu entries.
+    pub fn submenu(
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        items: impl IntoIterator<Item = MenuItem>,
+    ) -> Self {
+        let mut item = Self::new(id, label);
+        item.children = items.into_iter().collect();
+        item
+    }
+    /// Creates a non-interactive separator between menu entries.
+    pub fn separator() -> Self {
+        let mut item = Self::new("separator", "");
+        item.separator = true;
+        item
+    }
+    /// Creates a non-interactive menu heading.
+    pub fn label(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
+        Self::new(id, label).disabled(true)
+    }
+    fn enabled(&self) -> bool {
+        !self.disabled && !self.separator
+    }
+}
+
+/// A committed leaf action, including its new checked state when applicable.
+#[derive(Clone, Debug)]
+pub struct MenuEvent {
+    /// Indices from the root menu to the activated leaf.
+    pub path: Vec<usize>,
+    /// The committed checked state, or `None` for a plain action.
+    pub checked: Option<bool>,
+}
+impl gpui_kit::EventEmitter<MenuEvent> for MenuState {}
+
+/// Retained popup visibility, item state and keyboard navigation. Emits `MenuEvent` on leaf activation.
+pub struct MenuState {
+    items: Vec<MenuItem>,
+    open: bool,
+    focus: FocusHandle,
+    trigger: FocusHandle,
+    return_focus: Option<FocusHandle>,
+    anchor: Bounds<Pixels>,
+    pointer: bool,
+    path: Vec<usize>,
+    highlighted: Vec<Option<usize>>,
+    row_bounds: Vec<Vec<Bounds<Pixels>>>,
+    popup_bounds: Vec<Bounds<Pixels>>,
+    query: String,
+    typed_at: Option<web_time::Instant>,
+    submenu_timer: Option<gpui_kit::Task<()>>,
+    width: Option<Pixels>,
+}
+
+/// How long the pointer rests on a submenu row before the submenu opens.
+const SUBMENU_HOVER_DELAY: Duration = Duration::from_millis(200);
+/// The gap kept between a menu panel and the window edge.
+const WINDOW_MARGIN: f32 = 8.;
+/// The shortest a menu panel gets before it scrolls in a very short window.
+const MIN_PANEL_HEIGHT: f32 = 96.;
+
+/// The tallest a menu panel can be before it scrolls: the larger of the room
+/// below and above `anchor` for a menu that drops from its trigger, or the
+/// window height for one beside its anchor (a context menu or a submenu),
+/// which slides up and down instead of flipping.
+#[doc(hidden)]
+pub fn menu_max_height(
+    anchor: Bounds<Pixels>,
+    viewport: gpui_kit::Size<Pixels>,
+    beside: bool,
+    offset: Pixels,
+) -> Pixels {
+    let margin = gpui_kit::px(WINDOW_MARGIN);
+    let room = if beside {
+        viewport.height - margin * 2.
+    } else {
+        let below = viewport.height - anchor.bottom() - offset - margin;
+        let above = anchor.top() - offset - margin;
+        below.max(above)
+    };
+    room.max(gpui_kit::px(MIN_PANEL_HEIGHT))
+}
+impl MenuState {
+    /// Creates a closed menu with the supplied entries and new focus handles.
+    pub fn new(items: impl IntoIterator<Item = MenuItem>, cx: &mut Context<Self>) -> Self {
+        Self {
+            items: items.into_iter().collect(),
+            open: false,
+            focus: cx.focus_handle().tab_stop(false),
+            trigger: cx.focus_handle().tab_stop(true),
+            return_focus: None,
+            anchor: Default::default(),
+            pointer: false,
+            path: Vec::new(),
+            highlighted: Vec::new(),
+            row_bounds: Vec::new(),
+            popup_bounds: Vec::new(),
+            query: String::new(),
+            typed_at: None,
+            submenu_timer: None,
+            width: None,
+        }
+    }
+    /// Gives the root panel a fixed width instead of sizing it to its widest
+    /// row. Submenus keep sizing to their content.
+    pub fn width(mut self, width: Pixels) -> Self {
+        self.width = Some(width);
+        self
+    }
+    /// Returns whether the popup is open.
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+    /// Replaces the menu entries and resets submenu navigation.
+    pub fn set_items(&mut self, items: impl IntoIterator<Item = MenuItem>, cx: &mut Context<Self>) {
+        self.items = items.into_iter().collect();
+        self.path.clear();
+        self.highlighted = vec![self.items.iter().position(MenuItem::enabled)];
+        cx.notify();
+    }
+    /// Returns the handle used by the menu trigger.
+    pub fn trigger_focus(&self) -> FocusHandle {
+        self.trigger.clone()
+    }
+    /// Opens the menu at its trigger and transfers keyboard focus into it.
+    pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_at(None, window, cx);
+    }
+    /// Opens at a pointer position, or at the trigger when the position is absent.
+    pub fn open_at(
+        &mut self,
+        point: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pointer = point.is_some();
+        self.return_focus = if self.pointer {
+            window.focused(cx)
+        } else {
+            None
+        };
+        if let Some(point) = point {
+            self.anchor = Bounds::new(point, gpui_kit::size(gpui_kit::px(0.), gpui_kit::px(0.)));
+        }
+        self.open = true;
+        self.path.clear();
+        self.query.clear();
+        self.highlighted = vec![self.items.iter().position(MenuItem::enabled)];
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+    /// Closes and optionally restores the prior context focus or menu trigger.
+    pub fn close(&mut self, restore: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.open = false;
+        self.path.clear();
+        if restore {
+            self.return_focus
+                .take()
+                .unwrap_or_else(|| self.trigger.clone())
+                .focus(window, cx);
+        }
+        cx.notify();
+    }
+    #[doc(hidden)]
+    pub fn submenu_key(&self, right: bool) -> bool {
+        if !right {
+            return !self.path.is_empty();
+        }
+        self.highlighted
+            .last()
+            .copied()
+            .flatten()
+            .is_some_and(|i| !self.level(self.path.len())[i].children.is_empty())
+    }
+    fn level(&self, depth: usize) -> &[MenuItem] {
+        let mut items = self.items.as_slice();
+        for &index in self.path.iter().take(depth) {
+            items = &items[index].children;
+        }
+        items
+    }
+    fn highlight(&mut self, depth: usize, index: usize, cx: &mut Context<Self>) {
+        if !self.level(depth)[index].enabled() {
+            return;
+        }
+        if self.highlighted.get(depth).copied().flatten() == Some(index) {
+            return;
+        }
+        self.path.truncate(depth);
+        self.highlighted.truncate(depth + 1);
+        self.highlighted[depth] = Some(index);
+        cx.notify();
+    }
+    /// Opens the submenu at `index` after a short rest, unless the pointer
+    /// has moved on to another row by then.
+    fn hover_submenu(
+        &mut self,
+        depth: usize,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.submenu_timer = None;
+        if self.level(depth)[index].children.is_empty() || self.path.get(depth) == Some(&index) {
+            return;
+        }
+        self.submenu_timer = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(SUBMENU_HOVER_DELAY).await;
+            _ = this.update(cx, |this, cx| {
+                if this.open
+                    && this.path.len() == depth
+                    && this.highlighted.get(depth).copied().flatten() == Some(index)
+                {
+                    this.open_submenu(depth, index, cx);
+                }
+            });
+        }));
+    }
+    fn open_submenu(&mut self, depth: usize, index: usize, cx: &mut Context<Self>) {
+        let first = self.level(depth)[index]
+            .children
+            .iter()
+            .position(MenuItem::enabled);
+        self.path.truncate(depth);
+        self.path.push(index);
+        self.highlighted.truncate(depth + 1);
+        self.highlighted.push(first);
+        cx.notify();
+    }
+    fn activate(
+        &mut self,
+        depth: usize,
+        index: usize,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let item = self.level(depth)[index].clone();
+        if !item.enabled() {
+            return;
+        }
+        if !item.children.is_empty() {
+            self.submenu_timer = None;
+            self.open_submenu(depth, index, cx);
+        } else {
+            let mut path = self.path[..depth].to_vec();
+            path.push(index);
+            let checked = item.checked.map(|value| item.radio || !value);
+            if let Some(checked) = checked {
+                let mut items = &mut self.items;
+                for &parent in &path[..depth] {
+                    items = &mut items[parent].children;
+                }
+                if item.radio {
+                    for sibling in items.iter_mut().filter(|item| item.radio) {
+                        sibling.checked = Some(false);
+                    }
+                }
+                items[index].checked = Some(checked);
+            }
+            self.close(true, window, cx);
+            cx.emit(MenuEvent { path, checked });
+            // The handler runs once this update returns, so it can update the
+            // menu, for example to rebuild its items from a radio choice.
+            if let Some(handler) = item.handler {
+                let event = event.clone();
+                window.defer(cx, move |window, cx| handler(&event, window, cx));
+            }
+        }
+    }
+    fn key(&mut self, event: &gpui_kit::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.open {
+            return;
+        }
+        let depth = self.path.len();
+        // Submenus open toward the reading end, so the arrows swap in
+        // right-to-left layouts.
+        let direction = UiTheme::read(cx).direction;
+        let key = direction.logical_key(event.keystroke.key.as_str());
+        if key == "escape" {
+            self.close(true, window, cx);
+        } else if key == "tab" {
+            self.close(true, window, cx);
+            return;
+        } else if event.keystroke.modifiers.modified() {
+            return;
+        } else if key == "left" && depth > 0 {
+            self.path.pop();
+            self.highlighted.pop();
+            cx.notify();
+        } else if matches!(key, "enter" | "space" | "right") {
+            if let Some(index) = self.highlighted[depth]
+                && (key != "right" || !self.level(depth)[index].children.is_empty())
+            {
+                self.activate(
+                    depth,
+                    index,
+                    &ClickEvent::Keyboard(Default::default()),
+                    window,
+                    cx,
+                );
+            }
+        } else {
+            let items = self.level(depth);
+            let enabled: Vec<_> = items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, item)| item.enabled().then_some(i))
+                .collect();
+            if enabled.is_empty() {
+                return;
+            }
+            let current = enabled
+                .iter()
+                .position(|i| Some(*i) == self.highlighted[depth])
+                .unwrap_or(0);
+            let next = match key {
+                "up" => Some(enabled[(current + enabled.len() - 1) % enabled.len()]),
+                "down" => Some(enabled[(current + 1) % enabled.len()]),
+                "home" => enabled.first().copied(),
+                "end" => enabled.last().copied(),
+                _ if key.chars().count() == 1 => {
+                    let now = web_time::Instant::now();
+                    if self
+                        .typed_at
+                        .is_none_or(|time| now.duration_since(time) > Duration::from_millis(700))
+                    {
+                        self.query.clear();
+                    }
+                    self.typed_at = Some(now);
+                    self.query.push_str(key);
+                    let query = self.query.to_lowercase();
+                    enabled.into_iter().find(|&i| {
+                        self.level(depth)[i]
+                            .label
+                            .to_lowercase()
+                            .starts_with(&query)
+                    })
+                }
+                _ => return,
+            };
+            if let Some(index) = next {
+                self.highlight(depth, index, cx);
+            }
+        }
+        cx.stop_propagation();
+    }
+}
+impl Focusable for MenuState {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+impl Render for MenuState {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = UiTheme::read(cx).clone();
+        let viewport = window.viewport_size();
+        let os = cx.platform_info().os;
+        let escape = cx.entity().downgrade();
+        let mut root = dismiss::on_escape(div(), move |window, cx| {
+            escape
+                .update(cx, |this, cx| {
+                    let open = this.open;
+                    if open {
+                        this.close(true, window, cx);
+                    }
+                    open
+                })
+                .unwrap_or(false)
+        })
+        .id(("menu", cx.entity_id()))
+        .track_focus(&self.focus)
+        .capture_key_down(cx.listener(Self::key));
+        if !self.open {
+            return root;
+        }
+        self.row_bounds.resize_with(self.path.len() + 1, Vec::new);
+        self.popup_bounds
+            .resize(self.path.len() + 1, Default::default());
+        for depth in 0..=self.path.len() {
+            let items = self.level(depth).to_vec();
+            self.row_bounds[depth].resize(items.len(), Default::default());
+            let entity = cx.entity();
+            let popup_id = if depth == 0 {
+                ElementId::from(("menu-popup", cx.entity_id()))
+            } else {
+                (
+                    self.level(depth - 1)[self.path[depth - 1]].id.clone(),
+                    "popup",
+                )
+                    .into()
+            };
+            let anchor = if depth == 0 {
+                self.anchor
+            } else {
+                self.row_bounds[depth - 1][self.path[depth - 1]]
+            };
+            let beside = depth > 0 || self.pointer;
+            let mut popup = div()
+                .id(popup_id)
+                .relative()
+                .role(Role::Menu)
+                .min_w(t.space(40.))
+                .when_some(self.width.filter(|_| depth == 0), |popup, width| {
+                    popup.w(width)
+                })
+                .max_h(menu_max_height(anchor, viewport, beside, t.space(1.)))
+                .debug_selector(move || format!("menu-popup-{depth}"))
+                .overflow_y_scroll()
+                .map(|popup| surface::menu(popup, &t))
+                .on_prepaint(move |bounds, _, cx| {
+                    entity.update(cx, |this, _| this.popup_bounds[depth] = bounds)
+                })
+                .on_mouse_down_out(cx.listener(
+                    |this, event: &gpui_kit::MouseDownEvent, window, cx| {
+                        if !this.anchor.contains(&event.position)
+                            && !this
+                                .popup_bounds
+                                .iter()
+                                .any(|b| b.contains(&event.position))
+                        {
+                            this.close(false, window, cx);
+                        }
+                    },
+                ));
+            for (index, item) in items.into_iter().enumerate() {
+                if item.separator {
+                    popup = popup.child(
+                        div()
+                            .h(gpui_kit::px(1.))
+                            .my(t.space(1.5))
+                            .bg(t.colors.border),
+                    );
+                    continue;
+                }
+                let entity = cx.entity();
+                let selected = self.highlighted[depth] == Some(index);
+                let submenu = !item.children.is_empty();
+                let role = if submenu {
+                    Role::MenuItem
+                } else if item.link {
+                    Role::Link
+                } else if item.radio {
+                    Role::MenuItemRadio
+                } else if item.checked.is_some() {
+                    Role::MenuItemCheckBox
+                } else {
+                    Role::MenuItem
+                };
+                let row = Button::new(item.id.clone())
+                    .role(role)
+                    .focusable(false)
+                    .disabled(item.disabled)
+                    .accessibility_label(item.label.clone())
+                    .relative()
+                    .w_full()
+                    .min_h(t.space(if item.rich() { 9. } else { 8. }))
+                    .mirror_row(t.direction)
+                    .justify_start()
+                    .gap(t.space(if item.leading.is_some() { 2.5 } else { 2. }))
+                    .px(t.space(1.5))
+                    // GPUI Kit's Button shrinks the line box to the font size,
+                    // which truncate() would clip the descenders to.
+                    .line_height(text::line_height(&t, t.text(14.)))
+                    // A name over a description gets room to breathe: the
+                    // button's fixed height would press the two lines together.
+                    .when(item.description.is_some(), |b| b.h_auto().py(t.space(0.75)))
+                    .rounded(t.radius.sm)
+                    .when(selected, |b| b.bg(t.colors.accent).aria_active_descendant())
+                    .map(|b| disabled::dim(b, item.disabled))
+                    .when_some(item.checked, |b, checked| {
+                        b.aria_toggled(if checked {
+                            gpui_kit::Toggled::True
+                        } else {
+                            gpui_kit::Toggled::False
+                        })
+                    })
+                    .when(submenu, |b| {
+                        b.aria_expanded(self.path.get(depth) == Some(&index))
+                    })
+                    .on_prepaint(move |bounds, window, cx| {
+                        entity.update(cx, |this, _| {
+                            if this.row_bounds[depth][index] != bounds {
+                                this.row_bounds[depth][index] = bounds;
+                                window.request_animation_frame();
+                            }
+                        })
+                    })
+                    .on_hover(cx.listener(move |this, hovered, window, cx| {
+                        if *hovered {
+                            this.highlight(depth, index, cx);
+                            this.hover_submenu(depth, index, window, cx);
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, event, window, cx| {
+                        this.activate(depth, index, event, window, cx)
+                    }))
+                    .map(|b| match (&item.leading, item.icon) {
+                        (Some(slot), _) => b.child(
+                            div()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .child(slot(window, cx)),
+                        ),
+                        (None, Some(icon)) => b.child(
+                            lucide(icon)
+                                .flex_shrink_0()
+                                .size(t.space(4.))
+                                .text_color(t.colors.muted_foreground),
+                        ),
+                        (None, None) => b,
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .debug_selector(|| "menu-label".into())
+                                    .truncate()
+                                    .child(item.label.clone()),
+                            )
+                            .when_some(item.description.clone(), |col, description| {
+                                col.child(
+                                    text::control(div(), &t, t.text(12.))
+                                        .debug_selector(|| "menu-description".into())
+                                        .truncate()
+                                        .font_weight(FontWeight::NORMAL)
+                                        .text_color(t.colors.muted_foreground)
+                                        .child(description),
+                                )
+                            }),
+                    )
+                    .when_some(item.trailing.clone(), |b, slot| {
+                        b.child(
+                            div()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .child(slot(window, cx)),
+                        )
+                    })
+                    .when(item.checked == Some(true), |b| {
+                        b.child(
+                            lucide(LucideIcon::Check)
+                                .size(t.space(4.))
+                                .text_color(t.colors.popover_foreground),
+                        )
+                    })
+                    .when_some(item.shortcut.clone(), |b, shortcut| {
+                        b.child(
+                            key_label(
+                                &format_shortcut(&shortcut, os),
+                                t.text(12.),
+                                t.colors.muted_foreground.into(),
+                            )
+                            .debug_selector(|| "menu-shortcut".into())
+                            .flex_shrink_0()
+                            .text_size(t.text(12.)),
+                        )
+                    })
+                    .when(submenu, |b| {
+                        b.child(
+                            lucide(t.direction.icon(
+                                true,
+                                LucideIcon::ChevronLeft,
+                                LucideIcon::ChevronRight,
+                            ))
+                            .size(t.space(4.))
+                            .text_color(t.colors.popover_foreground),
+                        )
+                    });
+                popup = popup.child(row);
+            }
+            root = root.child(
+                gpui_kit::deferred(
+                    Positioner::side(anchor)
+                        .align(t.direction.align(Align::Start))
+                        .margin(gpui_kit::px(WINDOW_MARGIN))
+                        .placement(t.direction.placement(if beside {
+                            Placement::Right
+                        } else {
+                            Placement::Bottom
+                        }))
+                        .offset(t.space(1.))
+                        .occlude()
+                        .child(popup),
+                )
+                .with_priority(gpui_kit::base::POPUP_PRIORITY + depth),
+            );
+        }
+        root
+    }
+}
+
+#[derive(IntoElement)]
+/// A named menu trigger or context area backed by retained menu state.
+pub struct Menu {
+    state: Entity<MenuState>,
+    label: SharedString,
+    disabled: bool,
+    context: Option<AnyElement>,
+    trigger: Option<AnyElement>,
+    trigger_style: Option<Box<dyn FnOnce(Button) -> Button>>,
+    style: StyleRefinement,
+}
+impl Menu {
+    /// Creates a named trigger for the caller's retained menu state.
+    pub fn new(state: &Entity<MenuState>, label: impl Into<SharedString>) -> Self {
+        Self {
+            state: state.clone(),
+            label: label.into(),
+            disabled: false,
+            context: None,
+            trigger: None,
+            trigger_style: None,
+            style: Default::default(),
+        }
+    }
+    /// Supplies custom content for the named trigger button.
+    pub fn trigger(mut self, child: impl IntoElement) -> Self {
+        self.trigger = Some(child.into_any_element());
+        self
+    }
+    /// Replaces trigger styling while retaining menu behavior. Include a visible keyboard focus treatment.
+    pub fn trigger_style_with(mut self, style: impl FnOnce(Button) -> Button + 'static) -> Self {
+        self.trigger_style = Some(Box::new(style));
+        self
+    }
+    /// Disables interaction and applies the disabled appearance.
+    pub fn disabled(mut self, value: bool) -> Self {
+        self.disabled = value;
+        self
+    }
+    /// Replaces the button trigger with content that opens a menu on secondary click or Shift+F10.
+    pub fn context_area(mut self, child: impl IntoElement) -> Self {
+        self.context = Some(child.into_any_element());
+        self
+    }
+}
+impl Styled for Menu {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+impl RenderOnce for Menu {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let state = self.state.clone();
+        let keyboard = state.clone();
+        let measured = state.clone();
+        let context = self.context.is_some();
+        let disabled = self.disabled;
+        let focus = state.read(cx).trigger.clone();
+        let open = state.read(cx).open;
+        let mut base = div()
+            .id(("menu-trigger", state.entity_id()))
+            .test_support()
+            .relative()
+            .on_prepaint(move |bounds, _, cx| {
+                measured.update(cx, |this, _| {
+                    if !this.pointer || !this.open {
+                        this.anchor = bounds;
+                    }
+                })
+            })
+            .capture_key_down(move |event, window, cx| {
+                let key = event.keystroke.key.as_str();
+                if !disabled
+                    && keyboard.read(cx).trigger.is_focused(window)
+                    && ((!context && (key == "down" || key == "up"))
+                        || (context && key == "f10" && event.keystroke.modifiers.shift))
+                {
+                    keyboard.update(cx, |this, cx| this.open(window, cx));
+                    cx.stop_propagation();
+                }
+            });
+        if let Some(area) = self.context {
+            base = base
+                .track_focus(&focus.tab_stop(!disabled))
+                .aria_label(self.label)
+                // Keep the content's focus for selection and context-menu restoration.
+                .capture_any_mouse_down(|event, window, _| {
+                    if matches!(event.button, MouseButton::Left | MouseButton::Right) {
+                        window.prevent_default();
+                    }
+                })
+                .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                    if !disabled {
+                        state.update(cx, |this, cx| {
+                            this.open_at(Some(event.position), window, cx)
+                        });
+                        cx.stop_propagation();
+                    }
+                })
+                .child(area);
+        } else {
+            base = base.child(
+                Button::new(("menu-button", state.entity_id()))
+                    .track_focus(&focus)
+                    .tab_stop(focus.tab_stop)
+                    .disabled(disabled)
+                    .accessibility_label(self.label.clone())
+                    .aria_expanded(open)
+                    .map(|button| match self.trigger_style {
+                        Some(style) => style(button),
+                        None => style_button(
+                            button,
+                            disabled,
+                            ButtonVariant::Outline,
+                            ButtonSize::Default,
+                            UiTheme::read(cx),
+                        ),
+                    })
+                    .on_click(move |_, window, cx| {
+                        state.update(cx, |this, cx| {
+                            if this.open {
+                                this.close(true, window, cx);
+                            } else {
+                                this.open(window, cx);
+                            }
+                        })
+                    })
+                    .child(
+                        self.trigger
+                            .unwrap_or_else(|| self.label.into_any_element()),
+                    ),
+            );
+        }
+        apply_style(base.child(self.state), &self.style)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::{AppContext as _, point, px, size};
+
+    #[test]
+    fn a_menu_uses_the_room_in_the_window() {
+        let viewport = size(px(1000.), px(800.));
+        let offset = px(4.);
+        // A trigger near the top drops a panel almost to the bottom edge.
+        let top = Bounds::new(point(px(10.), px(20.)), size(px(80.), px(32.)));
+        assert_eq!(
+            menu_max_height(top, viewport, false, offset),
+            px(800. - 52. - 4. - 8.)
+        );
+        // A trigger near the bottom has more room above, where it flips.
+        let bottom = Bounds::new(point(px(10.), px(700.)), size(px(80.), px(32.)));
+        assert_eq!(
+            menu_max_height(bottom, viewport, false, offset),
+            px(700. - 4. - 8.)
+        );
+        // A context menu or submenu slides along the window's full height.
+        assert_eq!(
+            menu_max_height(bottom, viewport, true, offset),
+            px(800. - 16.)
+        );
+        // A very short window still shows a few rows and scrolls.
+        let tiny = size(px(300.), px(60.));
+        assert_eq!(menu_max_height(top, tiny, false, offset), px(96.));
+    }
+
+    struct LongMenu {
+        state: Entity<MenuState>,
+    }
+    impl Render for LongMenu {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .p(px(16.))
+                .child(Menu::new(&self.state, "Message actions"))
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_long_menu_does_not_scroll_in_a_tall_window(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(super::super::theme::init);
+        let (view, cx) = cx.add_window_view(|_, cx| LongMenu {
+            state: cx.new(|cx| {
+                MenuState::new(
+                    (0..12).map(|i| MenuItem::new(("item", i as u64), format!("Action {i}"))),
+                    cx,
+                )
+            }),
+        });
+        cx.simulate_resize(size(px(800.), px(800.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            let state = view.read(cx).state.clone();
+            state.update(cx, |menu, cx| menu.open(window, cx));
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let popup = cx.debug_bounds("menu-popup-0").expect("the menu is open");
+        // Twelve 32px rows plus padding: taller than the old 288px cap.
+        assert!(popup.size.height > px(12. * 32.), "{popup:?}");
+    }
+
+    #[gpui_kit::test]
+    fn rich_items_draw_their_shortcut_and_grow_to_36px(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(super::super::theme::init);
+        let (view, cx) = cx.add_window_view(|_, cx| LongMenu {
+            state: cx.new(|cx| {
+                MenuState::new(
+                    [
+                        MenuItem::new("tech", "Tech")
+                            .icon(LucideIcon::Users)
+                            .description("karya.team")
+                            .trailing(|_, _| div().child("3").into_any_element())
+                            .shortcut("secondary-alt-1")
+                            .radio(true),
+                        MenuItem::new("join", "Join another team…").icon(LucideIcon::Plus),
+                    ],
+                    cx,
+                )
+                .width(px(300.))
+            }),
+        });
+        cx.simulate_resize(size(px(800.), px(800.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            let state = view.read(cx).state.clone();
+            state.update(cx, |menu, cx| menu.open(window, cx));
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let popup = cx.debug_bounds("menu-popup-0").expect("the menu is open");
+        assert_eq!(popup.size.width, px(300.));
+        assert!(popup.size.height >= px(2. * 36.), "{popup:?}");
+        let shortcut = cx
+            .debug_bounds("menu-shortcut")
+            .expect("the shortcut is drawn");
+        assert!(shortcut.size.width > px(0.));
+        // The shortcut sits at the trailing edge of the panel.
+        assert!(
+            shortcut.right() > popup.right() - px(24.),
+            "{shortcut:?} {popup:?}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn resting_on_a_submenu_row_opens_it_and_a_sibling_closes_it(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(super::super::theme::init);
+        let window = cx.add_window(|_, cx| {
+            MenuState::new(
+                [
+                    MenuItem::new("reply", "Reply"),
+                    MenuItem::submenu(
+                        "remind",
+                        "Remind me",
+                        [
+                            MenuItem::new("hour", "In 1 hour"),
+                            MenuItem::new("tomorrow", "Tomorrow"),
+                        ],
+                    ),
+                    MenuItem::new("copy", "Copy link"),
+                ],
+                cx,
+            )
+        });
+        window
+            .update(cx, |menu, window, cx| {
+                menu.open(window, cx);
+                menu.highlight(0, 1, cx);
+                menu.hover_submenu(0, 1, window, cx);
+            })
+            .unwrap();
+        cx.executor().advance_clock(SUBMENU_HOVER_DELAY / 2);
+        cx.run_until_parked();
+        window
+            .update(cx, |menu, _, _| {
+                assert!(menu.path.is_empty(), "not before the delay")
+            })
+            .unwrap();
+        cx.executor().advance_clock(SUBMENU_HOVER_DELAY);
+        cx.run_until_parked();
+        window
+            .update(cx, |menu, window, cx| {
+                assert_eq!(menu.path, [1], "the submenu opened");
+                menu.highlight(0, 2, cx);
+                menu.hover_submenu(0, 2, window, cx);
+                assert!(menu.path.is_empty(), "a sibling row closes it");
+                // Passing over the submenu row on the way elsewhere opens nothing.
+                menu.highlight(0, 1, cx);
+                menu.hover_submenu(0, 1, window, cx);
+                menu.highlight(0, 0, cx);
+                menu.hover_submenu(0, 0, window, cx);
+            })
+            .unwrap();
+        cx.executor().advance_clock(SUBMENU_HOVER_DELAY * 2);
+        cx.run_until_parked();
+        window
+            .update(cx, |menu, _, _| assert!(menu.path.is_empty()))
+            .unwrap();
+    }
+    #[gpui_kit::test]
+    fn check_actions_toggle_and_radio_actions_select_one(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(super::super::theme::init);
+        let window = cx.add_window(|_, cx| {
+            MenuState::new(
+                [
+                    MenuItem::new("notifications", "Notifications").checked(true),
+                    MenuItem::new("compact", "Compact").radio(true),
+                    MenuItem::new("comfortable", "Comfortable").radio(false),
+                    MenuItem::new("locked", "Locked")
+                        .checked(true)
+                        .disabled(true),
+                ],
+                cx,
+            )
+        });
+        window
+            .update(cx, |menu, window, cx| {
+                menu.activate(0, 0, &ClickEvent::default(), window, cx);
+                assert_eq!(menu.items[0].checked, Some(false));
+                menu.activate(0, 2, &ClickEvent::default(), window, cx);
+                assert_eq!(menu.items[1].checked, Some(false));
+                assert_eq!(menu.items[2].checked, Some(true));
+                menu.activate(0, 3, &ClickEvent::default(), window, cx);
+                assert_eq!(menu.items[3].checked, Some(true));
+            })
+            .unwrap();
+    }
+}
